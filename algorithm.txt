@@ -1,0 +1,27 @@
+
+targets to consider = [entry point]
+instructions = []
+found_targets = []
+
+
+until there are no more targets to consider:
+	target = [targets to consider] pop
+
+	push target in to found targets
+
+	nearest target = next nearest address in found_targets (default to max if nothing is found)
+
+	invalidate spans (in instructions) between target and nearest target.
+
+	disassemble between target and nearest target
+
+	for each of the found instructions disassembled instructions:
+		1. add their address and span to instructions
+		2. this instruction starts at exactly the address as a target to consider, remove it from target to consider.
+		2. If instruction is a jump/call with a target (call that xfer target)
+			a. Next if there is already a matching target in found targets
+			b. Next if there is already a matching target in targets to consider
+			c. if this is transfer to a matching instruction
+				1. add that matching instruction target to found_targets
+				2. next
+			d. Still here? Add xfer target to targets to consider.
