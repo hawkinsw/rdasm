@@ -1,8 +1,12 @@
+[build-dependencies]
+cmake = "0.1"
+
 [package]
 name = "rdasm"
 version = "0.1.0"
 authors = ["Will Hawkins <hawkinsw@borlaugic.com>"]
+build = "build.rs"
 
 [dependencies]
-xmas-elf = "0.6.2"
-capstone = "0.4.0"
+xmas-elf = ""
+capstone = ""

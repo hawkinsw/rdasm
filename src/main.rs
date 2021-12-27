@@ -1,45 +1,67 @@
 #![feature(vec_remove_item)]
 
-extern crate xmas_elf;
 extern crate capstone;
+extern crate xmas_elf;
 
-use std::env;
-use std::process::exit;
-use std::fs::File;
-use std::io::Read;
-use std::io;
-use xmas_elf::ElfFile;
-use xmas_elf::sections::SectionHeader;
-use xmas_elf::program::ProgramHeader;
-use std::ops::Bound::Included;
-use std::ops::Bound::Excluded;
-use capstone::arch::x86::X86OperandType;
 use capstone::arch::x86::X86InsnGroup;
+use capstone::arch::x86::X86OperandType;
 use capstone::arch::ArchOperand;
 use capstone::prelude::*;
+use std::fs::File;
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::ops::Bound::Excluded;
+use std::ops::Bound::Included;
+use std::process::exit;
+use std::{convert::TryInto, env};
+use xmas_elf::ElfFile;
 
 use std::collections::BTreeMap;
 
-struct InstructionSpan {
-	address: u64,
-	span: u32
+struct InstructionDisassembly {
+	disasm: Option<String>,
 }
 
 struct Disassembly<'a> {
 	elf: ElfFile<'a>,
-	engine: Capstone<'a>,
-	targets: BTreeMap<u64, InstructionSpan>,
-	instructions: BTreeMap<u64, InstructionSpan>,
+	engine: Capstone,
+	targets: BTreeMap<u64, InstructionDisassembly>,
+	instructions: BTreeMap<u64, InstructionDisassembly>,
 	max_insn_addr: u64,
 	min_insn_addr: u64,
-	file: String
+	_file: String,
 }
 
 impl<'a> Disassembly<'a> {
+	fn emit_instructions(&self, path: Option<String>) {
+		let mut output: Box<dyn Write> = Box::new(std::io::stdout());
 
-	fn print_instructions(&self) {
+		if let Some(path) = path {
+			match File::create(path) {
+				Ok(opened_output) => {
+					output = Box::new(opened_output);
+				}
+				Err(error) => {
+					println!("Could not open the output file: {}", error.to_string());
+					return;
+				}
+			}
+		}
+
 		for k in self.instructions.keys() {
-			println!("0x{:x}", k);
+			match &self.instructions[k].disasm {
+				Some(operation) => {
+					output
+						.write_fmt(format_args!("{}\n", operation))
+						.expect("Oops: Could not write disassembly to the specified output location.");
+				}
+				None => {
+					output
+						.write_fmt(format_args!("0x{:x}\n", k))
+						.expect("Oops: Could not write disassembly to the specified output location.");
+				}
+			}
 		}
 	}
 
@@ -50,15 +72,18 @@ impl<'a> Disassembly<'a> {
 			.mode(arch::x86::ArchMode::Mode64)
 			.build()
 			.expect("Oops: Could not create the capstone engine.");
-		capstone_engine.set_detail(true);
+		capstone_engine
+			.set_detail(true)
+			.expect("Oops: Could not set the detail on the capstone engine.");
 
-		d = Disassembly{elf: ElfFile::new(&bytes).unwrap(),
+		d = Disassembly {
+			elf: ElfFile::new(&bytes).unwrap(),
 			engine: capstone_engine,
 			targets: BTreeMap::new(),
 			instructions: BTreeMap::new(),
-			file: file,
+			_file: file,
 			max_insn_addr: 0,
-			min_insn_addr: 0
+			min_insn_addr: 0,
 		};
 
 		for s in d.elf.section_iter() {
@@ -71,27 +96,30 @@ impl<'a> Disassembly<'a> {
 		}
 
 		let entry_point = d.elf.header.pt2.entry_point();
-		d.targets.insert(entry_point, InstructionSpan{address: entry_point,span:0});
+		d.targets
+			.insert(entry_point, InstructionDisassembly { disasm: None });
 		return d;
 	}
 
 	fn next_target(&self, address: u64) -> u64 {
-		match self.targets
-		          .range((Excluded(address+1),Included(self.max_insn_addr)))
-		          .nth(0) {
+		match self
+			.targets
+			.range((Excluded(address + 1), Included(self.max_insn_addr)))
+			.nth(0)
+		{
 			Some(t) => *(t.0),
-			None => self.max_insn_addr
+			None => self.max_insn_addr,
 		}
 	}
 
 	fn instruction_at(&self, addr: &u64) -> bool {
 		match self.instructions.get(&addr) {
 			Some(_) => true,
-			None => false
+			None => false,
 		}
 	}
 
-	fn disassemble(&mut self) {
+	fn disassemble(&mut self, debug: bool) {
 		let mut targets_to_consider = Vec::<u64>::new();
 		targets_to_consider.push(self.elf.header.pt2.entry_point());
 		while !targets_to_consider.is_empty() {
@@ -106,51 +134,75 @@ impl<'a> Disassembly<'a> {
 				continue;
 			}
 
+			/*
+			 * Get the next for-sure valid instruction address after this one.
+			 */
 			next_target = self.next_target(target);
 
-			println!("Disassembling from 0x{:x} to 0x{:x}", target, next_target);
+			/*
+			 * We are going to disasemble between this target and that target.
+			 */
+			if debug {
+				println!(
+					"Debug: Disassembling from 0x{:x} to 0x{:x}",
+					target, next_target
+				);
+			}
 
 			/*
 			 * Add this target to self.targets.
 			 */
-			self.targets.insert(target, InstructionSpan{address: target, span:5});
+			self
+				.targets
+				.insert(target, InstructionDisassembly { disasm: None });
 
 			/*
 			 * Invalidate between target and next_target
 			 */
-			for k in self.targets.keys() {
+			for k in self.instructions.keys() {
 				if k >= &target && k <= &next_target {
-					println!("Invalidating 0x{:x}", k);
+					if debug {
+						println!("Debug: Previously disassembled something at 0x{:x}; however, a new target may invalidate that.", k);
+					}
 				}
 			}
 
-
-			if let Ok(insns)=
-				self.engine.disasm_all(&self.elf.input[target as usize..],
-				                       target) {
+			if let Ok(insns) = self
+				.engine
+				.disasm_all(&self.elf.input[target as usize..], target)
+			{
 				for i in insns.iter() {
 					if i.address() >= next_target {
-						println!("Stopping disassembly at the next_target address.");
+						if debug {
+							println!("Debug: Stopping disassembly at the next_target address.");
+						}
 						break;
 					}
 					/*
 					 * Add this instruction's address and span to the tentative
 					 * list of instructions.
 					 */
-					self.instructions.insert(i.address(),
-					                         InstructionSpan{address: i.address(),
-					                                         span: i.bytes().len() as u32
-					                                        });
+					self.instructions.insert(
+						i.address(),
+						InstructionDisassembly {
+							disasm: Some(i.to_string()),
+						},
+					);
 					/*
 					 * If this instruction is precisely at some place that
 					 * we are supposed to disassemble in the future, wipe
-					 * out that future target because it will get the 
+					 * out that future target because it will get the
 					 * exact same thing that we are getting now.
 					 */
 					if let Ok(idx) = targets_to_consider.binary_search(&i.address()) {
-						println!("Was going to consider 0x{:x} but already disassembled.",
-						         i.address());
-						targets_to_consider.remove_item(&(idx as u64));
+						if debug {
+							println!(
+								"Debug: Was going to consider 0x{:x} but already disassembled.",
+								i.address()
+							);
+						}
+						let idx_u64 = (idx as u64).try_into().unwrap();
+						targets_to_consider.swap_remove(idx_u64);
 						continue;
 					}
 
@@ -162,7 +214,9 @@ impl<'a> Disassembly<'a> {
 						 * Skip this if it's already in our known targets.
 						 */
 						if let Some(_) = self.targets.get(&insn_target) {
-							println!("0x{:x} is already a found target.", insn_target);
+							if debug {
+								println!("Debug: 0x{:x} is already a found target.", insn_target);
+							}
 							continue;
 						}
 
@@ -171,7 +225,12 @@ impl<'a> Disassembly<'a> {
 						 * to consider this target.
 						 */
 						if targets_to_consider.contains(&insn_target) {
-							println!("0x{:x} is already set to be considered.", insn_target);
+							if debug {
+								println!(
+									"Debug: 0x{:x} is already set to be considered.",
+									insn_target
+								);
+							}
 							continue;
 						}
 
@@ -182,18 +241,22 @@ impl<'a> Disassembly<'a> {
 						 * add to the list of targets.
 						 */
 						if self.instruction_at(&insn_target) {
-							println!("0x{:x} matches an instruction.", insn_target);
-							self.instructions.insert(insn_target,
-							                         InstructionSpan{address: insn_target,
-							                                         span: 5});	
+							if debug {
+								println!("Debug: 0x{:x} matches an instruction.", insn_target);
+							}
+							self
+								.targets
+								.insert(insn_target, InstructionDisassembly { disasm: None });
 							continue;
 						}
 
 						/*
-						 * None of the above? We found a target location 
+						 * None of the above? We found a target location
 						 * that needs to be considered!
 						 */
-						println!("Adding 0x{:x} as a target to consider.", insn_target);
+						if debug {
+							println!("Debug: Adding 0x{:x} as a target to consider.", insn_target);
+						}
 						targets_to_consider.push(insn_target);
 					}
 				}
@@ -209,8 +272,9 @@ impl<'a> Disassembly<'a> {
 				 * are JUMP or CALL.
 				 */
 				for group in details.groups() {
-					if group == capstone::InsnGroupId(X86InsnGroup::X86_GRP_JUMP as u8) ||
-					   group == capstone::InsnGroupId(X86InsnGroup::X86_GRP_CALL as u8) {
+					if *group == capstone::InsnGroupId(X86InsnGroup::X86_GRP_JUMP as u8)
+						|| *group == capstone::InsnGroupId(X86InsnGroup::X86_GRP_CALL as u8)
+					{
 						/*
 						 * Look for the immediate operand in the list of all
 						 * operands.
@@ -232,11 +296,11 @@ impl<'a> Disassembly<'a> {
 				 * target.
 				 */
 				return None;
-			},
+			}
 			/*
 			 * There are no details available for this instruction.
 			 */
-			Err(_) => None
+			Err(_) => None,
 		}
 	}
 }
@@ -246,13 +310,11 @@ fn open_file(path: &String) -> Result<Vec<u8>, io::Error> {
 	let mut buf = Vec::new();
 
 	match fm {
-		Ok(mut f) => {
-			match f.read_to_end(&mut buf) {
-				Ok(_) => Ok(buf),
-				Err(e) => Err(e)
-			}
+		Ok(mut f) => match f.read_to_end(&mut buf) {
+			Ok(_) => Ok(buf),
+			Err(e) => Err(e),
 		},
-		Err(e) => Err(e)
+		Err(e) => Err(e),
 	}
 }
 
@@ -266,6 +328,8 @@ fn main() {
 	let path: String;
 	let contents: Vec<u8>;
 	let mut disassembly: Disassembly;
+	let debug = true;
+	let mut output = None;
 
 	me = args.next().unwrap();
 
@@ -276,8 +340,12 @@ fn main() {
 		exit(-1);
 	}
 
+	if let Some(p) = args.next() {
+		output = Some(p);
+	}
+
 	contents = open_file(&path).unwrap();
 	disassembly = Disassembly::new(path, &contents);
-	disassembly.disassemble();
-	disassembly.print_instructions();
+	disassembly.disassemble(debug);
+	disassembly.emit_instructions(output);
 }
